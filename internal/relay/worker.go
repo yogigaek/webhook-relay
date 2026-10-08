@@ -43,9 +43,9 @@ type Worker struct {
 	MaxAttempts  int
 	PollInterval time.Duration
 	BatchSize    int
-	// Lease must outlast a whole batch, BatchSize deliveries back to back at the client timeout each:
-	// deliveries run one after another, and an event whose lease ran out can be claimed by another
-	// worker while this one is still on its way to it.
+	// Lease must outlast a whole batch, BatchSize deliveries back to back, each taking up to the
+	// client timeout plus OutcomeWriteTimeout: deliveries run one after another, and an event whose
+	// lease ran out can be claimed by another worker while this one is still on its way to it.
 	Lease time.Duration
 	// Backoff gives the delay before the next attempt after the given failed attempt.
 	Backoff func(attempt int) time.Duration
@@ -81,6 +81,9 @@ func (w *Worker) processBatch(ctx context.Context) int {
 	}
 	return len(deliveries)
 }
+
+// OutcomeWriteTimeout bounds recording the result of one delivery; it counts toward the lease.
+const OutcomeWriteTimeout = 5 * time.Second
 
 // The tracer is looked up per delivery rather than once at package load: a package-level tracer
 // stays bound to whichever global provider existed first.
@@ -122,12 +125,13 @@ func (w *Worker) handle(ctx context.Context, d store.Delivery) {
 
 	// The outcome is written with a fresh context so a shutdown starting right now cannot drop
 	// the result of a delivery that already happened.
-	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), OutcomeWriteTimeout)
 	defer cancel()
 
 	var (
 		permanent *permanentError
 		outcome   string
+		retryIn   time.Duration
 		recordErr error
 	)
 	switch {
@@ -139,28 +143,28 @@ func (w *Worker) handle(ctx context.Context, d store.Delivery) {
 		recordErr = w.Queue.Bury(writeCtx, d.ID, d.Attempt, err.Error())
 	default:
 		outcome = "retry"
-		recordErr = w.Queue.Retry(writeCtx, d.ID, d.Attempt, w.Backoff(d.Attempt), err.Error())
+		retryIn = w.Backoff(d.Attempt)
+		recordErr = w.Queue.Retry(writeCtx, d.ID, d.Attempt, retryIn, err.Error())
 	}
 
 	switch {
 	case errors.Is(recordErr, store.ErrLeaseLost):
 		// Another attempt owns the event now and will record its own result.
 		log.WarnContext(ctx, "outcome discarded: lease lost", "outcome", outcome)
-		span.SetAttributes(attribute.String("relay.outcome", "lease_lost"))
+		outcome = "lease_lost"
 	case recordErr != nil:
 		// The lease brings the event back, so it is delivered again rather than lost.
 		log.ErrorContext(ctx, "record outcome", "outcome", outcome, "error", recordErr)
-		span.SetAttributes(attribute.String("relay.outcome", "unrecorded"))
+		outcome = "unrecorded"
 	case outcome == "delivered":
 		log.InfoContext(ctx, "event delivered")
-		span.SetAttributes(attribute.String("relay.outcome", outcome))
 	case outcome == "dead":
 		log.WarnContext(ctx, "event moved to dead letter", "reason", err.Error())
-		span.SetAttributes(attribute.String("relay.outcome", outcome))
 	default:
-		log.WarnContext(ctx, "delivery failed, will retry", "reason", err.Error())
-		span.SetAttributes(attribute.String("relay.outcome", outcome))
+		log.WarnContext(ctx, "delivery failed, will retry", "reason", err.Error(), "retry_in", retryIn.String())
+		span.SetAttributes(attribute.String("relay.retry_in", retryIn.String()))
 	}
+	span.SetAttributes(attribute.String("relay.outcome", outcome))
 }
 
 // permanentError marks a failure that retrying cannot fix.

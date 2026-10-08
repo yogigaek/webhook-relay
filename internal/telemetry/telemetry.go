@@ -5,6 +5,7 @@ import (
 	"context"
 	"log/slog"
 	"os"
+	"slices"
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -55,8 +56,8 @@ type LogHandler struct {
 }
 
 func (h LogHandler) Handle(ctx context.Context, r slog.Record) error {
-	if sc := trace.SpanContextFromContext(ctx); sc.IsValid() {
-		r.AddAttrs(slog.String("trace_id", sc.TraceID().String()), slog.String("span_id", sc.SpanID().String()))
+	if ids := traceAttrs(ctx); ids != nil {
+		r.AddAttrs(ids...)
 	}
 	return h.Handler.Handle(ctx, r)
 }
@@ -66,5 +67,64 @@ func (h LogHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 }
 
 func (h LogHandler) WithGroup(name string) slog.Handler {
-	return LogHandler{h.Handler.WithGroup(name)}
+	if name == "" {
+		return h
+	}
+	return groupedLogHandler{Handler: h.Handler.WithGroup(name), root: h.Handler, steps: []logStep{{group: name}}}
+}
+
+// groupedLogHandler is a LogHandler after WithGroup. Record attributes land inside the open group,
+// so the trace ids cannot simply be added to the record: they are added to root, the handler from
+// before the first group, and the groups and attributes since then are applied again on top.
+// That rebuild costs a little on every traced record, and is only paid by loggers that use groups.
+type groupedLogHandler struct {
+	slog.Handler // root with every step applied: used as is for records without a span
+	root         slog.Handler
+	steps        []logStep
+}
+
+// logStep is one WithGroup (group set) or WithAttrs (attrs set) call made since the first group.
+type logStep struct {
+	group string
+	attrs []slog.Attr
+}
+
+func (h groupedLogHandler) Handle(ctx context.Context, r slog.Record) error {
+	ids := traceAttrs(ctx)
+	if ids == nil {
+		return h.Handler.Handle(ctx, r)
+	}
+	next := h.root.WithAttrs(ids)
+	for _, step := range h.steps {
+		if step.group != "" {
+			next = next.WithGroup(step.group)
+		} else {
+			next = next.WithAttrs(step.attrs)
+		}
+	}
+	return next.Handle(ctx, r)
+}
+
+func (h groupedLogHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return h.with(h.Handler.WithAttrs(attrs), logStep{attrs: attrs})
+}
+
+func (h groupedLogHandler) WithGroup(name string) slog.Handler {
+	if name == "" {
+		return h
+	}
+	return h.with(h.Handler.WithGroup(name), logStep{group: name})
+}
+
+func (h groupedLogHandler) with(applied slog.Handler, step logStep) slog.Handler {
+	// Clip: handlers derived from the same parent must not append into one shared backing array.
+	return groupedLogHandler{Handler: applied, root: h.root, steps: append(slices.Clip(h.steps), step)}
+}
+
+func traceAttrs(ctx context.Context) []slog.Attr {
+	sc := trace.SpanContextFromContext(ctx)
+	if !sc.IsValid() {
+		return nil
+	}
+	return []slog.Attr{slog.String("trace_id", sc.TraceID().String()), slog.String("span_id", sc.SpanID().String())}
 }

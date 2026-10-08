@@ -9,6 +9,8 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
@@ -20,7 +22,8 @@ import (
 func main() {
 	logger := slog.New(telemetry.LogHandler{Handler: slog.NewJSONHandler(os.Stdout, nil)})
 	// The relay sends traceparent, so the sink's span lands in the same trace as the delivery.
-	if _, err := telemetry.Setup(context.Background(), "sink"); err != nil {
+	shutdownTracing, err := telemetry.Setup(context.Background(), "sink")
+	if err != nil {
 		logger.Error("telemetry", "error", err)
 		os.Exit(1)
 	}
@@ -52,9 +55,34 @@ func main() {
 	})
 
 	server := &http.Server{Addr: ":9000", Handler: otelhttp.NewHandler(mux, "sink"), ReadHeaderTimeout: 5 * time.Second}
+	// SIGTERM from Docker: stop, then flush the batched spans, or the last deliveries vanish from
+	// their traces. Registered before the server starts, so no signal can arrive unhandled.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 	logger.Info("sink listening", "addr", server.Addr)
-	if err := server.ListenAndServe(); err != nil {
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- server.ListenAndServe() }()
+
+	exitCode := 0
+	select {
+	case err := <-serveErr:
 		logger.Error("sink stopped", "error", err)
-		os.Exit(1)
+		exitCode = 1
+	case <-ctx.Done():
+		// back to the default: a second Ctrl+C or SIGTERM ends the process at once
+		stop()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			logger.Warn("shutdown", "error", err)
+		}
+	}
+	flushCtx, cancelFlush := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelFlush()
+	if err := shutdownTracing(flushCtx); err != nil {
+		logger.Warn("flush traces", "error", err)
+	}
+	if exitCode != 0 {
+		os.Exit(exitCode)
 	}
 }

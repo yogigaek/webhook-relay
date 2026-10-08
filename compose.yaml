@@ -44,11 +44,16 @@ services:
       OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
     ports:
       - "127.0.0.1:8080:8080"
+    # Worst case on SIGTERM: 10s HTTP drain, a delivery in flight (10s timeout + 5s outcome write),
+    # 5s trace flush. Docker's default 10s would SIGKILL partway through.
+    stop_grace_period: 40s
 
   sink:
     profiles: [demo]
     build: .
     entrypoint: ["/usr/local/bin/sink"]
+    # 5s HTTP drain + 5s trace flush, with room to spare
+    stop_grace_period: 15s
     environment:
       DELIVERY_SECRET: *delivery-secret
       OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318

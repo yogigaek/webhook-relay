@@ -13,8 +13,10 @@ import (
 	"time"
 
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/baggage"
 	"go.opentelemetry.io/otel/propagation"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	"go.opentelemetry.io/otel/trace/noop"
 
 	"github.com/yogigaek/webhook-relay/internal/signature"
@@ -31,12 +33,15 @@ type fakeStore struct {
 	mu   sync.Mutex
 	seen map[string]bool
 	last store.Event
-	err  error // returned by every call when set
+	// lastCtx is the request context Save ran with, for checking what reached it
+	lastCtx context.Context
+	err     error // returned by every call when set
 }
 
-func (f *fakeStore) Save(_ context.Context, e store.Event) (bool, error) {
+func (f *fakeStore) Save(ctx context.Context, e store.Event) (bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.lastCtx = ctx
 	if f.err != nil {
 		return false, f.err
 	}
@@ -192,9 +197,12 @@ func TestProbes(t *testing.T) {
 }
 
 // An event received inside a trace keeps that trace's id, so its later delivery can link back.
-func TestWebhookStoresTraceParent(t *testing.T) {
-	otel.SetTracerProvider(sdktrace.NewTracerProvider())
-	otel.SetTextMapPropagator(propagation.TraceContext{})
+// Providers are outside the trust boundary: their traceparent must not decide sampling or which
+// trace the receive span joins. It is kept only as a link.
+func TestWebhookStartsOwnTrace(t *testing.T) {
+	spans := tracetest.NewSpanRecorder()
+	otel.SetTracerProvider(sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(spans)))
+	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(propagation.TraceContext{}, propagation.Baggage{}))
 	t.Cleanup(func() {
 		otel.SetTracerProvider(noop.NewTracerProvider())
 		otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator())
@@ -205,8 +213,9 @@ func TestWebhookStoresTraceParent(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/webhooks/acme-pay", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set(signature.Header, signed(body))
-	// the provider's own trace, as a caller that propagates W3C trace context would send it
-	req.Header.Set("traceparent", "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
+	// a foreign trace, flagged as not sampled
+	req.Header.Set("traceparent", "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00")
+	req.Header.Set("baggage", "tenant=attacker")
 	rec := httptest.NewRecorder()
 
 	newTestHandler(s).ServeHTTP(rec, req)
@@ -214,7 +223,22 @@ func TestWebhookStoresTraceParent(t *testing.T) {
 	if rec.Code != http.StatusAccepted {
 		t.Fatalf("status = %d", rec.Code)
 	}
-	if !strings.HasPrefix(s.last.TraceParent, "00-4bf92f3577b34da6a3ce929d0e0e4736-") {
-		t.Errorf("stored traceparent %q does not continue the incoming trace", s.last.TraceParent)
+	tp := s.last.TraceParent
+	if tp == "" || strings.Contains(tp, "4bf92f3577b34da6a3ce929d0e0e4736") {
+		t.Errorf("stored traceparent %q, want a trace of the relay's own", tp)
+	}
+	if !strings.HasSuffix(tp, "-01") {
+		t.Errorf("stored traceparent %q is not sampled: the caller turned tracing off", tp)
+	}
+	if b := baggage.FromContext(s.lastCtx); b.Len() != 0 {
+		t.Errorf("caller's baggage %q reached the request context", b.String())
+	}
+	ended := spans.Ended()
+	if len(ended) != 1 {
+		t.Fatalf("got %d spans, want 1", len(ended))
+	}
+	links := ended[0].Links()
+	if len(links) != 1 || links[0].SpanContext.TraceID().String() != "4bf92f3577b34da6a3ce929d0e0e4736" {
+		t.Errorf("span links = %v, want one link to the caller's trace", links)
 	}
 }

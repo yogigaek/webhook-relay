@@ -1,11 +1,13 @@
 package relay
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -153,6 +155,23 @@ func TestRetryUsesBackoff(t *testing.T) {
 
 	if got := q.retried[1]; got != 2*time.Second {
 		t.Errorf("retry delay = %v, want Backoff(2) = 2s", got)
+	}
+}
+
+// An operator reading the logs must be able to tell when the next attempt happens.
+func TestRetryLogsDelay(t *testing.T) {
+	dest := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	defer dest.Close()
+	var buf bytes.Buffer
+	w := newWorker(newFakeQueue(), dest.URL)
+	w.Logger = slog.New(slog.NewTextHandler(&buf, nil))
+
+	w.handle(context.Background(), delivery(2))
+
+	if !strings.Contains(buf.String(), "retry_in=2s") {
+		t.Errorf("retry log does not carry retry_in=2s:\n%s", buf.String())
 	}
 }
 

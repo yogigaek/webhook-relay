@@ -29,9 +29,20 @@ func New(pool *pgxpool.Pool) *Store {
 	return &Store{pool: pool}
 }
 
-// ErrInvalidPayload means PostgreSQL refused the payload itself, so retrying cannot help. The one
-// known case: JSON that is valid but holds \u0000, which a JSONB column cannot store.
+// ErrInvalidPayload means PostgreSQL refused the data itself, so retrying cannot help. Go's JSON
+// decoder accepts input PostgreSQL does not: \u0000 (refused by JSONB, and by TEXT in the event id),
+// lone surrogates such as \ud800, and bytes that are not UTF-8.
 var ErrInvalidPayload = errors.New("payload cannot be stored")
+
+// unstorable lists the SQLSTATE codes the provider's own bytes cause, so the same insert fails every
+// time. Not the whole class 22: a code there can also come from a bug on our side (a narrowed
+// column gives 22001), and a 400 would make the provider drop an event the fixed relay could store;
+// a 500 keeps it coming back.
+var unstorable = map[string]bool{
+	"22P05": true, // untranslatable_character: \u0000 in JSONB
+	"22021": true, // character_not_in_repertoire: a NUL in TEXT, bytes that are not UTF-8
+	"22P02": true, // invalid_text_representation: JSON PostgreSQL rejects, such as a lone \ud800
+}
 
 // Save stores e and reports whether it was new. A second Save for the same provider and event id
 // stores nothing and returns false: providers retry webhooks they already sent, and each event
@@ -51,7 +62,7 @@ func (s *Store) Save(ctx context.Context, e Event) (bool, error) {
 		return false, nil
 	}
 	var pgErr *pgconn.PgError
-	if errors.As(err, &pgErr) && pgErr.Code == "22P05" { // untranslatable_character
+	if errors.As(err, &pgErr) && unstorable[pgErr.Code] {
 		return false, ErrInvalidPayload
 	}
 	if err != nil {

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io/fs"
 	"sort"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -34,8 +35,7 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 	if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock($1)`, migrationLock); err != nil {
 		return fmt.Errorf("take migration lock: %w", err)
 	}
-	// unlocked with a fresh context, so a cancelled start still frees the lock
-	defer conn.Exec(context.WithoutCancel(ctx), `SELECT pg_advisory_unlock($1)`, migrationLock) //nolint:errcheck
+	defer unlock(ctx, conn)
 
 	if _, err := conn.Exec(ctx, `CREATE TABLE IF NOT EXISTS schema_migrations (
 		version    TEXT PRIMARY KEY,
@@ -56,6 +56,20 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 		}
 	}
 	return nil
+}
+
+// unlock frees the migration lock. It runs with a fresh context, so a cancelled start still frees the
+// lock, but with a timeout of its own, so a database that stopped answering cannot hang the start.
+// A failed unlock does not fail Migrate: closing the connection frees the lock anyway, and failing
+// a start whose migrations all committed would only make the relay restart for nothing.
+func unlock(ctx context.Context, conn *pgxpool.Conn) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	if _, err := conn.Exec(ctx, `SELECT pg_advisory_unlock($1)`, migrationLock); err != nil {
+		// The session may still hold the lock. Closing the connection ends the session, which frees
+		// it, and the pool drops a closed connection instead of handing it to the next Migrate.
+		_ = conn.Conn().Close(ctx)
+	}
 }
 
 func applyOne(ctx context.Context, conn *pgx.Conn, name string) error {

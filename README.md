@@ -27,7 +27,9 @@ flowchart LR
 1. **Receive.** The handler checks the provider, content type and size, verifies the HMAC signature
    against the raw body, and requires a string `id` in the JSON. It stores the event and answers `202`.
    A resent event answers `200 duplicate`. A database error answers `500`, so the provider retries;
-   a payload PostgreSQL can never store (JSON holding `\u0000`) answers `400`, so it does not.
+   a payload PostgreSQL can never store answers `400`, so it does not: `\u0000`, a lone surrogate
+   such as `\ud800`, or bytes that are not UTF-8 (SQLSTATE `22P05`, `22021`, `22P02`). Other data
+   errors stay `500` on purpose: they can come from a bug in the relay, and a retried event survives it.
 2. **Relay.** A worker claims due events in batches, posts each one to the internal service signed
    with its own secret, and records the outcome.
 
@@ -37,7 +39,7 @@ flowchart LR
 |---|---|
 | An event is stored once, even when copies arrive together | `UNIQUE (provider, event_id)` and a single `INSERT … ON CONFLICT DO NOTHING`. Checking first and inserting after would let two simultaneous copies both pass. Tested with 20 concurrent copies. |
 | Forged or replayed requests are rejected | HMAC-SHA256 over `"<timestamp>.<raw body>"`, compared in constant time (`hmac.Equal`), with a 5 minute window. Every signature rejection gets the same response; the reason is only logged. |
-| An accepted event is never lost | It is in PostgreSQL before `202` is sent. A worker that crashes mid-delivery holds a lease, not a lock: the event becomes due again when the lease expires. The lease covers a whole batch of timed-out deliveries. |
+| An accepted event is never lost | It is in PostgreSQL before `202` is sent. A worker that crashes mid-delivery holds a lease, not a lock: the event becomes due again when the lease expires. The lease covers a whole batch of deliveries that each hit the delivery timeout and the 5s outcome-write timeout. |
 | A slow worker cannot overwrite a newer attempt | Outcomes are written only while the row is still on the attempt being reported (`WHERE attempts = $n`), a fencing token. A worker that overran its lease finds its write ignored and logs it. |
 | Several workers can run at once | `FOR UPDATE SKIP LOCKED` in a CTE: workers split the due events without waiting on or double-claiming each other's rows. Tested with 5 workers and 50 events. |
 | Failures back off instead of hammering a struggling service | Exponential backoff (10s, 20s, 40s … capped at 1h) with jitter, up to `MAX_ATTEMPTS` (default 8). |
@@ -59,11 +61,13 @@ Other choices worth knowing:
 ## Observability
 
 - **Structured JSON logs** (`log/slog`); any line written inside a request or delivery carries its
-  `trace_id` and `span_id`.
+  `trace_id` and `span_id`, at the top level of the line even inside a `slog` group.
 - **OpenTelemetry traces** over OTLP/HTTP when `OTEL_EXPORTER_OTLP_ENDPOINT` is set: the webhook
   request, every SQL query (`otelpgx`), each delivery attempt, and the outgoing HTTP call. Delivery
   happens later than receipt, so it is its own trace with a **span link** back to the request that
-  received the event (the request's `traceparent` is stored with the event). The outgoing request
+  received the event (the relay's receive span's `traceparent` is stored with the event). The webhook
+  route is a public endpoint: a provider's `traceparent` never decides sampling or which trace the
+  receive span joins, it only becomes a span link, and its `baggage` is ignored. The outgoing request
   sends `traceparent`, so the internal service's spans join the delivery trace.
 - `GET /healthz` answers whether the process is alive and never touches the database;
   `GET /readyz` answers whether it can take traffic and pings PostgreSQL.

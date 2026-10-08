@@ -106,8 +106,9 @@ func run(logger *slog.Logger) error {
 		MaxAttempts:  cfg.MaxAttempts,
 		PollInterval: time.Second,
 		BatchSize:    batchSize,
-		// long enough for a full batch of timed-out deliveries, plus room for the database writes
-		Lease:   batchSize*deliveryTimeout + time.Minute,
+		// long enough for a full batch of timed-out deliveries whose outcome writes also time out,
+		// plus room for the claim query
+		Lease:   batchSize*(deliveryTimeout+relay.OutcomeWriteTimeout) + time.Minute,
 		Backoff: relay.ExponentialBackoff(10*time.Second, time.Hour),
 	}
 	workerCtx, stopWorker := context.WithCancel(ctx)

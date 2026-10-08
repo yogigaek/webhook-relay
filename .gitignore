@@ -2,3 +2,7 @@
 *.test
 *.out
 .env
+
+# Claude Code: local notes and settings, not part of the project
+CLAUDE.md
+/.claude

@@ -303,6 +303,28 @@ func TestSaveRejectsNullCharacter(t *testing.T) {
 	}
 }
 
+// Input PostgreSQL refuses for what it is must not come back as a retryable error, or the provider
+// retries it forever. Each of these passes the handler's JSON check.
+func TestSaveRejectsUnstorableInput(t *testing.T) {
+	s := newTestStore(t)
+	tests := []struct {
+		name string
+		e    Event
+	}{
+		// the payload holds no \u0000, so only the event id can be refused (22021, not 22P05)
+		{"NUL in event id", Event{Provider: "acme-pay", EventID: "a\x00b", Payload: []byte(`{"id":"x"}`)}},
+		{"lone surrogate in payload", Event{Provider: "acme-pay", EventID: "evt_surrogate", Payload: []byte(`{"id":"evt_surrogate","note":"\ud800"}`)}},
+		{"invalid UTF-8 in payload", Event{Provider: "acme-pay", EventID: "evt_utf8", Payload: []byte("{\"id\":\"evt_utf8\",\"note\":\"\xff\"}")}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := s.Save(context.Background(), tt.e); !errors.Is(err, ErrInvalidPayload) {
+				t.Errorf("Save error = %v, want ErrInvalidPayload", err)
+			}
+		})
+	}
+}
+
 // Several instances starting at once all migrate without error.
 func TestMigrateConcurrently(t *testing.T) {
 	s := newTestStore(t)

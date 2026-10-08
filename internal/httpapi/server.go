@@ -55,7 +55,13 @@ func NewHandler(opts Options) http.Handler {
 	mux.HandleFunc("GET /readyz", handleReady(opts))
 	// The span is named after the route pattern, not the URL, so every provider shares one name.
 	const webhookRoute = "POST /webhooks/{provider}"
-	mux.Handle(webhookRoute, otelhttp.NewHandler(handleWebhook(opts), webhookRoute))
+	mux.Handle(webhookRoute, otelhttp.NewHandler(handleWebhook(opts), webhookRoute,
+		// Anyone can call this route, so its trace context is not trusted: the span starts a trace of
+		// our own (a caller cannot switch sampling off or pick the trace) and only links to theirs.
+		otelhttp.WithPublicEndpointFn(func(*http.Request) bool { return true }),
+		// no Baggage propagator: a caller's baggage is not let into the request context
+		otelhttp.WithPropagators(propagation.TraceContext{}),
+	))
 	return mux
 }
 
