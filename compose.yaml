@@ -1,24 +1,54 @@
-# Local PostgreSQL for development and the store tests:
+# Development: only PostgreSQL, for `go run` and the store tests.
 #   docker compose up -d
 #   export DATABASE_URL=postgres://relay:relay@localhost:5434/relay
-#   export TEST_DATABASE_URL=$DATABASE_URL
+#   export TEST_DATABASE_URL=postgres://relay:relay@localhost:5434/relay_test
+#
+# Demo: the relay and a sink that stands in for the internal service, all in containers.
+#   docker compose --profile demo up --build
+#
 # Port 5434 so it does not clash with PostgreSQL servers commonly on 5432 or 5433.
+# Every password and secret here is a placeholder for local use only.
+
+x-delivery-secret: &delivery-secret demo-delivery-secret-change-me-0123456789
+
 services:
   postgres:
     image: postgres:17-alpine
     environment:
       POSTGRES_USER: relay
-      POSTGRES_PASSWORD: relay # local development only
+      POSTGRES_PASSWORD: relay
       POSTGRES_DB: relay
     ports:
       - "127.0.0.1:5434:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
+      - ./scripts/init-test-db.sql:/docker-entrypoint-initdb.d/init-test-db.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U relay -d relay"]
       interval: 2s
       timeout: 3s
       retries: 15
+
+  relay:
+    profiles: [demo]
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://relay:relay@postgres:5432/relay
+      PROVIDER_SECRETS: acme-pay=demo-provider-secret-change-me-0123456789
+      DELIVERY_URL: http://sink:9000/events
+      DELIVERY_SECRET: *delivery-secret
+    ports:
+      - "127.0.0.1:8080:8080"
+
+  sink:
+    profiles: [demo]
+    build: .
+    entrypoint: ["/usr/local/bin/sink"]
+    environment:
+      DELIVERY_SECRET: *delivery-secret
 
 volumes:
   pgdata:

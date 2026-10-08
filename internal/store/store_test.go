@@ -13,6 +13,7 @@ import (
 
 // These tests need a real PostgreSQL. They run when TEST_DATABASE_URL is set (docker compose up
 // provides one) and are skipped otherwise, so `go test ./...` still works without a database.
+// They empty the events table, so point TEST_DATABASE_URL at a database used only for tests.
 func newTestStore(t *testing.T) *Store {
 	t.Helper()
 	url := os.Getenv("TEST_DATABASE_URL")
