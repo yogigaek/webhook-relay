@@ -2,6 +2,7 @@
 package httpapi
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -11,14 +12,26 @@ import (
 	"time"
 
 	"github.com/yogigaek/webhook-relay/internal/signature"
+	"github.com/yogigaek/webhook-relay/internal/store"
 )
 
 // MaxBodyBytes caps a webhook payload. Providers send small JSON documents; anything larger is
 // rejected before it is read into memory.
 const MaxBodyBytes = 1 << 20 // 1 MiB
 
+// maxEventIDLength bounds the idempotency key that ends up in a unique index.
+const maxEventIDLength = 255
+
+// EventStore is the part of the store the handlers need. *store.Store satisfies it; unit tests
+// use an in-memory fake, so they run without a database.
+type EventStore interface {
+	Save(ctx context.Context, e store.Event) (inserted bool, err error)
+	Ping(ctx context.Context) error
+}
+
 type Options struct {
 	Logger *slog.Logger
+	Store  EventStore
 	// Secrets maps a provider name to its signing secret; any other provider gets 404.
 	Secrets            map[string][]byte
 	SignatureTolerance time.Duration
@@ -33,12 +46,29 @@ func NewHandler(opts Options) http.Handler {
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", handleHealth)
+	mux.HandleFunc("GET /readyz", handleReady(opts))
 	mux.HandleFunc("POST /webhooks/{provider}", handleWebhook(opts))
 	return mux
 }
 
+// handleHealth answers "is the process alive"; it never touches the database, so a database
+// outage does not get the container restarted for nothing.
 func handleHealth(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+// handleReady answers "can it take traffic", which needs the database.
+func handleReady(opts Options) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+		defer cancel()
+		if err := opts.Store.Ping(ctx); err != nil {
+			opts.Logger.WarnContext(r.Context(), "not ready", "error", err)
+			writeError(w, http.StatusServiceUnavailable, "database unavailable")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ready"})
+	}
 }
 
 func handleWebhook(opts Options) http.HandlerFunc {
@@ -77,13 +107,31 @@ func handleWebhook(opts Options) http.HandlerFunc {
 			return
 		}
 
-		if !json.Valid(body) {
-			writeError(w, http.StatusBadRequest, "body is not valid JSON")
+		// The provider's event id is the idempotency key, so every event must carry one.
+		var envelope struct {
+			ID string `json:"id"`
+		}
+		if err := json.Unmarshal(body, &envelope); err != nil || envelope.ID == "" || len(envelope.ID) > maxEventIDLength {
+			writeError(w, http.StatusBadRequest, `body must be a JSON object with a string "id"`)
 			return
 		}
 
-		// Storage (stage 3) happens before this response once it exists.
-		opts.Logger.InfoContext(r.Context(), "webhook received", "provider", provider, "bytes", len(body))
+		inserted, err := opts.Store.Save(r.Context(), store.Event{Provider: provider, EventID: envelope.ID, Payload: body})
+		if err != nil {
+			// 500 makes the provider retry later, which is what should happen while the database
+			// is down: the event is not lost, only delayed.
+			opts.Logger.ErrorContext(r.Context(), "store event", "provider", provider, "event_id", envelope.ID, "error", err)
+			writeError(w, http.StatusInternalServerError, "could not store event")
+			return
+		}
+		if !inserted {
+			// Still a success, so the provider stops retrying an event that is already stored.
+			opts.Logger.InfoContext(r.Context(), "duplicate webhook ignored", "provider", provider, "event_id", envelope.ID)
+			writeJSON(w, http.StatusOK, map[string]string{"status": "duplicate"})
+			return
+		}
+
+		opts.Logger.InfoContext(r.Context(), "webhook stored", "provider", provider, "event_id", envelope.ID, "bytes", len(body))
 		writeJSON(w, http.StatusAccepted, map[string]string{"status": "accepted"})
 	}
 }

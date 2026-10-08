@@ -4,6 +4,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -11,8 +12,11 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+
 	"github.com/yogigaek/webhook-relay/internal/config"
 	"github.com/yogigaek/webhook-relay/internal/httpapi"
+	"github.com/yogigaek/webhook-relay/internal/store"
 )
 
 func main() {
@@ -29,10 +33,26 @@ func run(logger *slog.Logger) error {
 		return err
 	}
 
+	startCtx, cancelStart := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancelStart()
+	pool, err := pgxpool.New(startCtx, cfg.DatabaseURL)
+	if err != nil {
+		return fmt.Errorf("database config: %w", err)
+	}
+	defer pool.Close()
+	// pgxpool connects lazily; ping now so a wrong URL or a database that is down fails the start
+	if err := pool.Ping(startCtx); err != nil {
+		return fmt.Errorf("database unreachable: %w", err)
+	}
+	if err := store.Migrate(startCtx, pool); err != nil {
+		return err
+	}
+
 	server := &http.Server{
 		Addr: cfg.Addr,
 		Handler: httpapi.NewHandler(httpapi.Options{
 			Logger:             logger,
+			Store:              store.New(pool),
 			Secrets:            cfg.Secrets,
 			SignatureTolerance: cfg.SignatureTolerance,
 		}),

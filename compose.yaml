@@ -1,0 +1,24 @@
+# Local PostgreSQL for development and the store tests:
+#   docker compose up -d
+#   export DATABASE_URL=postgres://relay:relay@localhost:5434/relay
+#   export TEST_DATABASE_URL=$DATABASE_URL
+# Port 5434 so it does not clash with PostgreSQL servers commonly on 5432 or 5433.
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: relay
+      POSTGRES_PASSWORD: relay # local development only
+      POSTGRES_DB: relay
+    ports:
+      - "127.0.0.1:5434:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U relay -d relay"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+volumes:
+  pgdata:

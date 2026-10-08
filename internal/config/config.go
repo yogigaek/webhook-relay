@@ -17,18 +17,23 @@ const MinSecretLength = 32
 var providerPattern = regexp.MustCompile(`^[a-z0-9-]{1,32}$`)
 
 type Config struct {
-	Addr string
+	Addr        string
+	DatabaseURL string
 	// Secrets maps a provider name to its signing secret. A provider not listed here is unknown.
 	Secrets            map[string][]byte
 	SignatureTolerance time.Duration
 }
 
-// Load builds a Config from getenv (os.Getenv in production, a map in tests). Every problem is
-// reported at once, so a misconfigured deploy fails on start with the full list.
+// Load builds a Config from getenv (os.Getenv in production, a map in tests). It fails on start
+// rather than at the first request; every problem in PROVIDER_SECRETS is reported at once.
 func Load(getenv func(string) string) (Config, error) {
 	cfg := Config{
 		Addr:               ":" + or(getenv("PORT"), "8080"),
+		DatabaseURL:        getenv("DATABASE_URL"),
 		SignatureTolerance: 5 * time.Minute,
+	}
+	if cfg.DatabaseURL == "" {
+		return Config{}, errors.New("DATABASE_URL is empty: set it to a PostgreSQL connection string")
 	}
 
 	if v := getenv("SIGNATURE_TOLERANCE"); v != "" {

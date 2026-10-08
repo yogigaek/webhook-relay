@@ -8,8 +8,19 @@ import (
 
 const goodSecret = "0123456789abcdef0123456789abcdef" // exactly 32 characters
 
+const testDatabaseURL = "postgres://relay:relay@localhost:5434/relay"
+
+// env serves vars, with DATABASE_URL filled in unless the test sets it (to "" to leave it out).
 func env(vars map[string]string) func(string) string {
-	return func(key string) string { return vars[key] }
+	return func(key string) string {
+		if v, ok := vars[key]; ok {
+			return v
+		}
+		if key == "DATABASE_URL" {
+			return testDatabaseURL
+		}
+		return ""
+	}
 }
 
 func TestLoadDefaults(t *testing.T) {
@@ -19,6 +30,9 @@ func TestLoadDefaults(t *testing.T) {
 	}
 	if cfg.Addr != ":8080" {
 		t.Errorf("Addr = %q, want :8080", cfg.Addr)
+	}
+	if cfg.DatabaseURL != testDatabaseURL {
+		t.Errorf("DatabaseURL = %q", cfg.DatabaseURL)
 	}
 	if cfg.SignatureTolerance != 5*time.Minute {
 		t.Errorf("SignatureTolerance = %v, want 5m", cfg.SignatureTolerance)
@@ -52,6 +66,7 @@ func TestLoadErrors(t *testing.T) {
 		vars     map[string]string
 		wantText string
 	}{
+		{"no database", map[string]string{"DATABASE_URL": "", "PROVIDER_SECRETS": "a=" + goodSecret}, "DATABASE_URL is empty"},
 		{"no secrets", map[string]string{}, "PROVIDER_SECRETS is empty"},
 		{"missing equals", map[string]string{"PROVIDER_SECRETS": "acme-pay"}, "expected provider=secret"},
 		{"bad provider name", map[string]string{"PROVIDER_SECRETS": "Acme_Pay=" + goodSecret}, "must be 1-32 characters"},
