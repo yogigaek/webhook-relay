@@ -79,7 +79,7 @@ The demo starts the relay, a sink that stands in for the internal service, Postg
 Swagger UI:
 
 ```sh
-docker compose --profile demo up --build
+docker compose --profile demo up --build    # or: make demo
 ```
 
 | Service | URL |
@@ -225,6 +225,17 @@ docker compose up -d
 TEST_DATABASE_URL=postgres://relay:relay@localhost:5434/relay_test go test -race ./...
 ```
 
+The [`Makefile`](Makefile) wraps these and the other common commands; run `make` to list them:
+
+| Command | What it does |
+|---|---|
+| `make test` | Starts PostgreSQL and runs every test with the race detector |
+| `make test-unit` | Runs the tests that need no database |
+| `make lint` | `gofmt`, `go vet`, and `staticcheck` |
+| `make lint-api` | Lints the OpenAPI spec |
+| `make check` | Everything CI runs, except the Docker build |
+| `make demo` / `make demo-down` | Starts or stops the full demo |
+
 CI runs on pushes to `main` and on pull requests: `gofmt`, `go vet`, `staticcheck`, the full test suite with a
 PostgreSQL service, a lint of the OpenAPI spec, and a Docker image build.
 
@@ -247,6 +258,7 @@ its lease expires and the event is delivered after the restart, late but not los
 
 ```
 api/openapi.yaml    OpenAPI 3.1 spec: public route, probes, delivery to the internal service
+Makefile            shortcuts for tests, linting, and the demo
 cmd/webhook-relay   entry point: config, database, migrations, HTTP server, worker, shutdown
 cmd/sink            demo stand-in for the internal service
 internal/config     environment variables, validated on start
