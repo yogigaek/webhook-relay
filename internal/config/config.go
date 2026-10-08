@@ -4,7 +4,9 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -19,6 +21,11 @@ var providerPattern = regexp.MustCompile(`^[a-z0-9-]{1,32}$`)
 type Config struct {
 	Addr        string
 	DatabaseURL string
+	// DeliveryURL receives every stored event, signed with DeliverySecret.
+	DeliveryURL    string
+	DeliverySecret []byte
+	// MaxAttempts is how many deliveries are tried before an event goes to the dead letter.
+	MaxAttempts int
 	// Secrets maps a provider name to its signing secret. A provider not listed here is unknown.
 	Secrets            map[string][]byte
 	SignatureTolerance time.Duration
@@ -34,6 +41,24 @@ func Load(getenv func(string) string) (Config, error) {
 	}
 	if cfg.DatabaseURL == "" {
 		return Config{}, errors.New("DATABASE_URL is empty: set it to a PostgreSQL connection string")
+	}
+
+	cfg.DeliveryURL = getenv("DELIVERY_URL")
+	if u, err := url.Parse(cfg.DeliveryURL); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return Config{}, errors.New("DELIVERY_URL must be an http or https URL")
+	}
+	cfg.DeliverySecret = []byte(getenv("DELIVERY_SECRET"))
+	if len(cfg.DeliverySecret) < MinSecretLength {
+		return Config{}, fmt.Errorf("DELIVERY_SECRET must be at least %d characters", MinSecretLength)
+	}
+
+	cfg.MaxAttempts = 8
+	if v := getenv("MAX_ATTEMPTS"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 {
+			return Config{}, fmt.Errorf("MAX_ATTEMPTS: %q is not a whole number of at least 1", v)
+		}
+		cfg.MaxAttempts = n
 	}
 
 	if v := getenv("SIGNATURE_TOLERANCE"); v != "" {

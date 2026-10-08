@@ -10,16 +10,20 @@ const goodSecret = "0123456789abcdef0123456789abcdef" // exactly 32 characters
 
 const testDatabaseURL = "postgres://relay:relay@localhost:5434/relay"
 
-// env serves vars, with DATABASE_URL filled in unless the test sets it (to "" to leave it out).
+// defaults fills the required settings a test does not care about.
+var defaults = map[string]string{
+	"DATABASE_URL":    testDatabaseURL,
+	"DELIVERY_URL":    "http://localhost:9000/events",
+	"DELIVERY_SECRET": goodSecret,
+}
+
+// env serves vars, falling back to defaults; a test sets a key to "" to leave it out.
 func env(vars map[string]string) func(string) string {
 	return func(key string) string {
 		if v, ok := vars[key]; ok {
 			return v
 		}
-		if key == "DATABASE_URL" {
-			return testDatabaseURL
-		}
-		return ""
+		return defaults[key]
 	}
 }
 
@@ -36,6 +40,9 @@ func TestLoadDefaults(t *testing.T) {
 	}
 	if cfg.SignatureTolerance != 5*time.Minute {
 		t.Errorf("SignatureTolerance = %v, want 5m", cfg.SignatureTolerance)
+	}
+	if cfg.MaxAttempts != 8 {
+		t.Errorf("MaxAttempts = %d, want 8", cfg.MaxAttempts)
 	}
 	if string(cfg.Secrets["acme-pay"]) != goodSecret {
 		t.Errorf("secret for acme-pay not loaded")
@@ -68,6 +75,12 @@ func TestLoadErrors(t *testing.T) {
 	}{
 		{"no database", map[string]string{"DATABASE_URL": "", "PROVIDER_SECRETS": "a=" + goodSecret}, "DATABASE_URL is empty"},
 		{"no secrets", map[string]string{}, "PROVIDER_SECRETS is empty"},
+		{"no delivery url", map[string]string{"DELIVERY_URL": "", "PROVIDER_SECRETS": "a=" + goodSecret}, "DELIVERY_URL"},
+		{"delivery url without scheme", map[string]string{"DELIVERY_URL": "localhost:9000", "PROVIDER_SECRETS": "a=" + goodSecret}, "DELIVERY_URL"},
+		{"delivery url ftp", map[string]string{"DELIVERY_URL": "ftp://files.example", "PROVIDER_SECRETS": "a=" + goodSecret}, "DELIVERY_URL"},
+		{"short delivery secret", map[string]string{"DELIVERY_SECRET": "short", "PROVIDER_SECRETS": "a=" + goodSecret}, "DELIVERY_SECRET"},
+		{"zero attempts", map[string]string{"MAX_ATTEMPTS": "0", "PROVIDER_SECRETS": "a=" + goodSecret}, "MAX_ATTEMPTS"},
+		{"attempts not a number", map[string]string{"MAX_ATTEMPTS": "many", "PROVIDER_SECRETS": "a=" + goodSecret}, "MAX_ATTEMPTS"},
 		{"missing equals", map[string]string{"PROVIDER_SECRETS": "acme-pay"}, "expected provider=secret"},
 		{"bad provider name", map[string]string{"PROVIDER_SECRETS": "Acme_Pay=" + goodSecret}, "must be 1-32 characters"},
 		{"short secret", map[string]string{"PROVIDER_SECRETS": "acme-pay=short"}, "shorter than 32"},

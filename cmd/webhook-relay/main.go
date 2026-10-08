@@ -16,6 +16,7 @@ import (
 
 	"github.com/yogigaek/webhook-relay/internal/config"
 	"github.com/yogigaek/webhook-relay/internal/httpapi"
+	"github.com/yogigaek/webhook-relay/internal/relay"
 	"github.com/yogigaek/webhook-relay/internal/store"
 )
 
@@ -67,6 +68,31 @@ func run(logger *slog.Logger) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	worker := &relay.Worker{
+		Queue:  store.New(pool),
+		Logger: logger.With("component", "relay"),
+		// The timeout bounds one delivery; the lease below must stay longer than it.
+		Client:       &http.Client{Timeout: 10 * time.Second},
+		URL:          cfg.DeliveryURL,
+		Secret:       cfg.DeliverySecret,
+		MaxAttempts:  cfg.MaxAttempts,
+		PollInterval: time.Second,
+		BatchSize:    20,
+		Lease:        time.Minute,
+		Backoff:      relay.ExponentialBackoff(10*time.Second, time.Hour),
+	}
+	workerCtx, stopWorker := context.WithCancel(ctx)
+	workerDone := make(chan struct{})
+	go func() {
+		defer close(workerDone)
+		worker.Run(workerCtx)
+	}()
+	// On every way out of run, the worker finishes its current delivery before the pool closes.
+	defer func() {
+		stopWorker()
+		<-workerDone
+	}()
+
 	serveErr := make(chan error, 1)
 	go func() {
 		providers := make([]string, 0, len(cfg.Secrets))
@@ -94,6 +120,8 @@ func run(logger *slog.Logger) error {
 	if err := <-serveErr; !errors.Is(err, http.ErrServerClosed) {
 		return err
 	}
+	stopWorker()
+	<-workerDone
 	logger.Info("stopped")
 	return nil
 }
