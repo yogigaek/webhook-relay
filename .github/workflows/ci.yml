@@ -41,6 +41,13 @@ jobs:
       - name: test
         run: go test -race -count=1 ./...
 
+  api-docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: lint OpenAPI spec
+        run: npx --yes @redocly/cli@2.60.0 lint api/openapi.yaml
+
   docker:
     runs-on: ubuntu-latest
     steps:

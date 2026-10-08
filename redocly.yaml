@@ -1,0 +1,6 @@
+# Lint settings for api/openapi.yaml (`npx @redocly/cli lint`).
+extends:
+  - recommended
+rules:
+  # The relay is self-hosted; its only server is the local one from compose.yaml.
+  no-server-example.com: off

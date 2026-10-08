@@ -1,0 +1,372 @@
+openapi: 3.1.0
+info:
+  title: webhook-relay API
+  version: 1.0.0
+  summary: Receives payment-provider webhooks and relays them to an internal service.
+  description: |
+    The relay exposes one public route for payment providers and two probes for the platform.
+    Every accepted event is stored once in PostgreSQL and then delivered to the internal service
+    configured in `DELIVERY_URL`; that delivery is described under **Webhooks** (`outboundDelivery`) below.
+
+    ## Signatures
+
+    Requests in both directions carry the same header:
+
+    ```
+    X-Signature: t=<unix seconds>,v1=<hex HMAC-SHA256 of "<t>.<raw body>">
+    ```
+
+    The signature covers the timestamp and the exact bytes of the body, so it must be computed on
+    the body as sent, before any re-encoding. A timestamp more than `SIGNATURE_TOLERANCE` (default
+    5 minutes) away from the receiver's clock, in either direction, is rejected. Example in shell:
+
+    ```sh
+    ts=$(date +%s)
+    sig=$(printf '%s.%s' "$ts" "$body" | openssl dgst -sha256 -hmac "$SECRET" | awk '{print $NF}')
+    curl -H "X-Signature: t=$ts,v1=$sig" ...
+    ```
+
+    ## Idempotency
+
+    The top-level `id` of the event, together with the provider in the path, identifies an event.
+    Sending the same event again stores nothing and answers `200` with `"status": "duplicate"`, so a
+    provider's retries are always safe.
+
+    ## Retrying
+
+    For the provider, `2xx` means "stored, stop sending". `500` means "not stored, retry later".
+    Every other `4xx` describes a request that will fail the same way if sent again.
+  license:
+    name: MIT
+    identifier: MIT
+  contact:
+    name: Muhammad Yogi
+    url: https://github.com/yogigaek/webhook-relay
+
+servers:
+  - url: http://localhost:8080
+    description: Local (`docker compose --profile demo up`)
+
+tags:
+  - name: Inbound
+    description: The public route payment providers send events to.
+  - name: Probes
+    description: Liveness and readiness checks for the platform (Docker, Kubernetes, a load balancer).
+
+paths:
+  /webhooks/{provider}:
+    post:
+      tags: [Inbound]
+      operationId: receiveWebhook
+      summary: Receive a provider webhook
+      description: |
+        Verifies the signature against the raw body, requires a JSON object with a string `id`, and
+        stores the event. The checks run in this order, and the first failure answers:
+
+        1. provider is configured, else `404`
+        2. `Content-Type` is `application/json` (parameters such as `charset` are allowed), else `415`
+        3. body is at most 1 MiB, else `413`
+        4. signature is valid and fresh, else `401`
+        5. body is a JSON object with a string `id` of 1 to 255 bytes, else `400`
+        6. the event is stored: `202`, or `200` if it was stored before
+
+        The provider's `traceparent` header, if any, does not join the relay's trace; it is recorded
+        as a span link only.
+      security:
+        - webhookSignature: []
+      parameters:
+        - name: provider
+          in: path
+          required: true
+          description: A provider listed in `PROVIDER_SECRETS`; its secret verifies the signature.
+          schema:
+            type: string
+            pattern: '^[a-z0-9-]{1,32}$'
+          example: acme-pay
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProviderEvent'
+            examples:
+              paymentSucceeded:
+                summary: A payment event
+                value:
+                  id: evt_1
+                  type: payment.succeeded
+                  amount: 150000
+                  currency: IDR
+      responses:
+        '202':
+          description: Stored for the first time; it will be relayed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusResponse'
+              example:
+                status: accepted
+        '200':
+          description: Already stored earlier (same provider and `id`); nothing changed. The provider should stop retrying.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusResponse'
+              example:
+                status: duplicate
+        '400':
+          description: |
+            The body is not a JSON object with a string `id` of 1 to 255 bytes, it could not be read,
+            or it holds data PostgreSQL can never store (`\u0000`, a lone surrogate such as `\ud800`,
+            or bytes that are not UTF-8). Sending it again fails the same way.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                missingId:
+                  value:
+                    error: body must be a JSON object with a string "id"
+                unstorable:
+                  value:
+                    error: payload cannot be stored
+                unreadable:
+                  value:
+                    error: could not read body
+        '401':
+          description: |
+            The signature is missing, malformed, outside the time window, or does not match. The
+            response is the same in every case; the reason is only logged.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: invalid signature
+        '404':
+          description: The provider is not configured.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: unknown provider
+        '405':
+          description: The route only accepts `POST`. Plain-text body; the `Allow` header lists `POST`.
+          headers:
+            Allow:
+              schema:
+                type: string
+              example: POST
+          content:
+            text/plain:
+              schema:
+                type: string
+              example: Method Not Allowed
+        '413':
+          description: The body is larger than 1 MiB.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: payload too large
+        '415':
+          description: '`Content-Type` is missing or is not `application/json`.'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: content type must be application/json
+        '500':
+          description: The event could not be stored (for example, the database is down). Nothing was stored; retry later.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: could not store event
+
+  /healthz:
+    get:
+      tags: [Probes]
+      operationId: liveness
+      summary: Liveness
+      description: Answers while the process runs. It never touches the database, so a database outage does not get the process restarted.
+      security: []
+      responses:
+        '200':
+          description: The process is alive.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusResponse'
+              example:
+                status: ok
+        '405':
+          $ref: '#/components/responses/MethodNotAllowedGet'
+
+  /readyz:
+    get:
+      tags: [Probes]
+      operationId: readiness
+      summary: Readiness
+      description: Answers whether the relay can take traffic, by pinging PostgreSQL with a 2 second timeout.
+      security: []
+      responses:
+        '200':
+          description: PostgreSQL answered.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusResponse'
+              example:
+                status: ready
+        '503':
+          description: PostgreSQL did not answer in time.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: database unavailable
+        '405':
+          $ref: '#/components/responses/MethodNotAllowedGet'
+
+webhooks:
+  outboundDelivery:
+    post:
+      operationId: deliverEvent
+      summary: Event delivered to the internal service
+      description: |
+        Sent by the relay to `DELIVERY_URL` for every stored event. The internal service implements
+        this endpoint.
+
+        **Body.** The event JSON as received. It is equivalent to the provider's body but not
+        byte-identical: whitespace and key order are normalised by storage. The signature covers the
+        bytes actually sent, so verify it against the raw body you receive.
+
+        **At-least-once.** An event can arrive more than once (for example, when the relay restarts
+        mid-delivery), so deduplicate on `X-Relay-Event-Id` together with `X-Relay-Provider`.
+
+        **Timeout.** The relay waits up to 10 seconds for an answer.
+      security:
+        - deliverySignature: []
+      parameters:
+        - name: X-Relay-Provider
+          in: header
+          required: true
+          description: The provider the event came from.
+          schema:
+            type: string
+          example: acme-pay
+        - name: X-Relay-Event-Id
+          in: header
+          required: true
+          description: The provider's event `id`; deduplicate on it together with the provider.
+          schema:
+            type: string
+          example: evt_1
+        - name: X-Relay-Attempt
+          in: header
+          required: true
+          description: Delivery attempt number, starting at 1.
+          schema:
+            type: integer
+            minimum: 1
+          example: 1
+        - name: traceparent
+          in: header
+          required: false
+          description: W3C trace context of the delivery, so the receiver's spans join its trace.
+          schema:
+            type: string
+          example: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProviderEvent'
+            example:
+              id: evt_1
+              type: payment.succeeded
+              amount: 150000
+              currency: IDR
+      responses:
+        '2XX':
+          description: Delivered. The event is never sent again.
+        '408':
+          description: Retried later with backoff.
+        '429':
+          description: Retried later with backoff.
+        '4XX':
+          description: |
+            Any other `4xx` is treated as permanent: the event moves to the dead-letter state without
+            further attempts, for a person to look at.
+        '5XX':
+          description: |
+            Retried later with exponential backoff (10s, 20s, 40s … capped at 1h, each delay jittered
+            between half and its full value). A network error or timeout is treated the same way.
+            After `MAX_ATTEMPTS` (default 8) the event moves to the dead-letter state.
+
+components:
+  securitySchemes:
+    webhookSignature:
+      type: apiKey
+      in: header
+      name: X-Signature
+      description: |
+        `t=<unix seconds>,v1=<hex HMAC-SHA256>` over `"<t>.<raw body>"`, keyed with the provider's
+        secret from `PROVIDER_SECRETS`. See **Signatures** above.
+    deliverySignature:
+      type: apiKey
+      in: header
+      name: X-Signature
+      description: Same format as `webhookSignature`, keyed with `DELIVERY_SECRET`.
+
+  responses:
+    MethodNotAllowedGet:
+      description: The route only accepts `GET`. Plain-text body; the `Allow` header lists `GET, HEAD`.
+      headers:
+        Allow:
+          schema:
+            type: string
+          example: GET, HEAD
+      content:
+        text/plain:
+          schema:
+            type: string
+          example: Method Not Allowed
+
+  schemas:
+    ProviderEvent:
+      type: object
+      description: |
+        Any JSON object with a string `id`; every other field is the provider's own and is relayed
+        unchanged in meaning. At most 1 MiB in total.
+      required: [id]
+      properties:
+        id:
+          type: string
+          minLength: 1
+          description: The provider's event id, unique per provider. At most 255 bytes.
+          example: evt_1
+      additionalProperties: true
+
+    StatusResponse:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [accepted, duplicate, ok, ready]
+
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+          description: A short, fixed message; details are only in the relay's logs.

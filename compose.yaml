@@ -6,6 +6,7 @@
 # Demo: the relay, a sink that stands in for the internal service, and Jaeger for traces.
 #   docker compose --profile demo up --build
 #   traces: http://localhost:16686
+#   API docs: http://localhost:8081 (Swagger UI for api/openapi.yaml)
 #
 # Port 5434 so it does not clash with PostgreSQL servers commonly on 5432 or 5433.
 # Every password and secret here is a placeholder for local use only.
@@ -57,6 +58,20 @@ services:
     environment:
       DELIVERY_SECRET: *delivery-secret
       OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
+
+  api-docs:
+    profiles: [demo]
+    image: swaggerapi/swagger-ui:v5.33.1
+    environment:
+      SWAGGER_JSON: /spec/openapi.yaml
+      # the image copies the spec on start: after editing it, `docker compose restart api-docs`
+      # docs only: "Try it out" from :8081 would be blocked by CORS on :8080, and the webhook needs a
+      # signature anyway; the README has a working curl example
+      SUPPORTED_SUBMIT_METHODS: "[]"
+    volumes:
+      - ./api/openapi.yaml:/spec/openapi.yaml:ro
+    ports:
+      - "127.0.0.1:8081:8080"
 
   jaeger:
     profiles: [demo]
