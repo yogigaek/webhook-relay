@@ -12,6 +12,11 @@ import (
 	"testing"
 	"time"
 
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/propagation"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/trace/noop"
+
 	"github.com/yogigaek/webhook-relay/internal/signature"
 	"github.com/yogigaek/webhook-relay/internal/store"
 )
@@ -25,6 +30,7 @@ var (
 type fakeStore struct {
 	mu   sync.Mutex
 	seen map[string]bool
+	last store.Event
 	err  error // returned by every call when set
 }
 
@@ -39,6 +45,7 @@ func (f *fakeStore) Save(_ context.Context, e store.Event) (bool, error) {
 		return false, nil
 	}
 	f.seen[key] = true
+	f.last = e
 	return true, nil
 }
 
@@ -120,6 +127,14 @@ func TestWebhookDuplicate(t *testing.T) {
 	}
 }
 
+func TestWebhookUnstorablePayload(t *testing.T) {
+	h := newTestHandler(&fakeStore{err: store.ErrInvalidPayload})
+	body := `{"id":"evt_1"}`
+	if rec := postWebhook(h, "acme-pay", "application/json", signed(body), body); rec.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400 so the provider does not retry", rec.Code)
+	}
+}
+
 func TestWebhookStoreDown(t *testing.T) {
 	h := newTestHandler(&fakeStore{err: errors.New("connection refused")})
 	body := `{"id":"evt_1"}`
@@ -173,5 +188,33 @@ func TestProbes(t *testing.T) {
 				t.Errorf("status = %d, want %d", rec.Code, tt.wantStatus)
 			}
 		})
+	}
+}
+
+// An event received inside a trace keeps that trace's id, so its later delivery can link back.
+func TestWebhookStoresTraceParent(t *testing.T) {
+	otel.SetTracerProvider(sdktrace.NewTracerProvider())
+	otel.SetTextMapPropagator(propagation.TraceContext{})
+	t.Cleanup(func() {
+		otel.SetTracerProvider(noop.NewTracerProvider())
+		otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator())
+	})
+
+	s := &fakeStore{seen: map[string]bool{}}
+	body := `{"id":"evt_1"}`
+	req := httptest.NewRequest(http.MethodPost, "/webhooks/acme-pay", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(signature.Header, signed(body))
+	// the provider's own trace, as a caller that propagates W3C trace context would send it
+	req.Header.Set("traceparent", "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
+	rec := httptest.NewRecorder()
+
+	newTestHandler(s).ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	if !strings.HasPrefix(s.last.TraceParent, "00-4bf92f3577b34da6a3ce929d0e0e4736-") {
+		t.Errorf("stored traceparent %q does not continue the incoming trace", s.last.TraceParent)
 	}
 }

@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"sync"
@@ -142,6 +143,27 @@ func TestClaimDueLeasesEvents(t *testing.T) {
 	}
 }
 
+func TestTraceParentRoundTrip(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	const tp = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+	if _, err := s.Save(ctx, Event{Provider: "acme-pay", EventID: "evt_traced", Payload: []byte(`{}`), TraceParent: tp}); err != nil {
+		t.Fatal(err)
+	}
+	saveEvents(t, s, "evt_untraced")
+
+	got, err := s.ClaimDue(ctx, 10, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, d := range got {
+		want := map[string]string{"evt_traced": tp, "evt_untraced": ""}[d.EventID]
+		if d.TraceParent != want {
+			t.Errorf("%s TraceParent = %q, want %q", d.EventID, d.TraceParent, want)
+		}
+	}
+}
+
 func TestClaimDueAfterLeaseExpires(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
@@ -213,13 +235,13 @@ func TestDeliveryOutcomes(t *testing.T) {
 		byEvent[d.EventID] = d.ID
 	}
 
-	if err := s.MarkDelivered(ctx, byEvent["evt_ok"]); err != nil {
+	if err := s.MarkDelivered(ctx, byEvent["evt_ok"], 1); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Retry(ctx, byEvent["evt_retry"], 0, "status 503"); err != nil {
+	if err := s.Retry(ctx, byEvent["evt_retry"], 1, 0, "status 503"); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Bury(ctx, byEvent["evt_dead"], "status 400"); err != nil {
+	if err := s.Bury(ctx, byEvent["evt_dead"], 1, "status 400"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -240,5 +262,67 @@ func TestDeliveryOutcomes(t *testing.T) {
 	}
 	if len(again) != 1 || again[0].EventID != "evt_retry" || again[0].Attempt != 2 {
 		t.Errorf("claim after outcomes = %+v, want only evt_retry on attempt 2", again)
+	}
+}
+
+// A worker that overran its lease must not overwrite the attempt that took the event over.
+func TestStaleAttemptCannotRecordOutcome(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	saveEvents(t, s, "evt_1")
+
+	first, err := s.ClaimDue(ctx, 1, 0) // attempt 1, lease already over
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ClaimDue(ctx, 1, time.Minute); err != nil { // attempt 2 takes over
+		t.Fatal(err)
+	}
+
+	if err := s.MarkDelivered(ctx, first[0].ID, 1); !errors.Is(err, ErrLeaseLost) {
+		t.Errorf("stale MarkDelivered error = %v, want ErrLeaseLost", err)
+	}
+	if err := s.Bury(ctx, first[0].ID, 1, "late"); !errors.Is(err, ErrLeaseLost) {
+		t.Errorf("stale Bury error = %v, want ErrLeaseLost", err)
+	}
+	if status, attempts, _ := eventState(t, s, "evt_1"); status != "pending" || attempts != 2 {
+		t.Errorf("event = %s on attempt %d, want pending on attempt 2", status, attempts)
+	}
+	if err := s.MarkDelivered(ctx, first[0].ID, 2); err != nil {
+		t.Errorf("current attempt MarkDelivered error = %v", err)
+	}
+}
+
+// Valid JSON that JSONB cannot hold is reported as such, so the handler can answer 400 instead of
+// a 500 the provider would retry forever.
+func TestSaveRejectsNullCharacter(t *testing.T) {
+	s := newTestStore(t)
+	_, err := s.Save(context.Background(), Event{Provider: "acme-pay", EventID: "evt_nul", Payload: []byte(`{"id":"evt_nul","note":"a\u0000b"}`)})
+	if !errors.Is(err, ErrInvalidPayload) {
+		t.Errorf("Save error = %v, want ErrInvalidPayload", err)
+	}
+}
+
+// Several instances starting at once all migrate without error.
+func TestMigrateConcurrently(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	if _, err := s.pool.Exec(ctx, `DROP TABLE events; DROP TABLE schema_migrations`); err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	for range 5 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := Migrate(ctx, s.pool); err != nil {
+				t.Error(err)
+			}
+		}()
+	}
+	wg.Wait()
+	var n int
+	if err := s.pool.QueryRow(ctx, `SELECT count(*) FROM schema_migrations`).Scan(&n); err != nil || n != 2 {
+		t.Errorf("schema_migrations rows = %d (%v), want 2", n, err)
 	}
 }

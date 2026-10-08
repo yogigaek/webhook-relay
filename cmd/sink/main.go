@@ -4,17 +4,26 @@
 package main
 
 import (
+	"context"
 	"io"
 	"log/slog"
 	"net/http"
 	"os"
 	"time"
 
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+
 	"github.com/yogigaek/webhook-relay/internal/signature"
+	"github.com/yogigaek/webhook-relay/internal/telemetry"
 )
 
 func main() {
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	logger := slog.New(telemetry.LogHandler{Handler: slog.NewJSONHandler(os.Stdout, nil)})
+	// The relay sends traceparent, so the sink's span lands in the same trace as the delivery.
+	if _, err := telemetry.Setup(context.Background(), "sink"); err != nil {
+		logger.Error("telemetry", "error", err)
+		os.Exit(1)
+	}
 	secret := []byte(os.Getenv("DELIVERY_SECRET"))
 	if len(secret) == 0 {
 		logger.Error("DELIVERY_SECRET is empty")
@@ -29,11 +38,11 @@ func main() {
 			return
 		}
 		if err := signature.Verify(secret, r.Header.Get(signature.Header), body, time.Now(), 5*time.Minute); err != nil {
-			logger.Warn("rejected", "reason", err.Error())
+			logger.WarnContext(r.Context(), "rejected", "reason", err.Error())
 			http.Error(w, "invalid signature", http.StatusUnauthorized)
 			return
 		}
-		logger.Info("event received",
+		logger.InfoContext(r.Context(), "event received",
 			"provider", r.Header.Get("X-Relay-Provider"),
 			"event_id", r.Header.Get("X-Relay-Event-Id"),
 			"attempt", r.Header.Get("X-Relay-Attempt"),
@@ -42,7 +51,7 @@ func main() {
 		w.WriteHeader(http.StatusNoContent)
 	})
 
-	server := &http.Server{Addr: ":9000", Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	server := &http.Server{Addr: ":9000", Handler: otelhttp.NewHandler(mux, "sink"), ReadHeaderTimeout: 5 * time.Second}
 	logger.Info("sink listening", "addr", server.Addr)
 	if err := server.ListenAndServe(); err != nil {
 		logger.Error("sink stopped", "error", err)

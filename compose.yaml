@@ -3,8 +3,9 @@
 #   export DATABASE_URL=postgres://relay:relay@localhost:5434/relay
 #   export TEST_DATABASE_URL=postgres://relay:relay@localhost:5434/relay_test
 #
-# Demo: the relay and a sink that stands in for the internal service, all in containers.
+# Demo: the relay, a sink that stands in for the internal service, and Jaeger for traces.
 #   docker compose --profile demo up --build
+#   traces: http://localhost:16686
 #
 # Port 5434 so it does not clash with PostgreSQL servers commonly on 5432 or 5433.
 # Every password and secret here is a placeholder for local use only.
@@ -40,6 +41,7 @@ services:
       PROVIDER_SECRETS: acme-pay=demo-provider-secret-change-me-0123456789
       DELIVERY_URL: http://sink:9000/events
       DELIVERY_SECRET: *delivery-secret
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
     ports:
       - "127.0.0.1:8080:8080"
 
@@ -49,6 +51,13 @@ services:
     entrypoint: ["/usr/local/bin/sink"]
     environment:
       DELIVERY_SECRET: *delivery-secret
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
+
+  jaeger:
+    profiles: [demo]
+    image: jaegertracing/jaeger:2.11.0
+    ports:
+      - "127.0.0.1:16686:16686" # UI; OTLP (4318) stays inside the compose network
 
 volumes:
   pgdata:

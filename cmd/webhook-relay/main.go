@@ -12,16 +12,19 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/exaring/otelpgx"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 
 	"github.com/yogigaek/webhook-relay/internal/config"
 	"github.com/yogigaek/webhook-relay/internal/httpapi"
 	"github.com/yogigaek/webhook-relay/internal/relay"
 	"github.com/yogigaek/webhook-relay/internal/store"
+	"github.com/yogigaek/webhook-relay/internal/telemetry"
 )
 
 func main() {
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	logger := slog.New(telemetry.LogHandler{Handler: slog.NewJSONHandler(os.Stdout, nil)})
 	if err := run(logger); err != nil {
 		logger.Error("server stopped", "error", err)
 		os.Exit(1)
@@ -36,7 +39,27 @@ func run(logger *slog.Logger) error {
 
 	startCtx, cancelStart := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancelStart()
-	pool, err := pgxpool.New(startCtx, cfg.DatabaseURL)
+
+	shutdownTracing, err := telemetry.Setup(startCtx, "webhook-relay")
+	if err != nil {
+		return fmt.Errorf("telemetry: %w", err)
+	}
+	// Last to run: flushes the spans of everything that happened during shutdown too.
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := shutdownTracing(ctx); err != nil {
+			logger.Warn("flush traces", "error", err)
+		}
+	}()
+
+	poolConfig, err := pgxpool.ParseConfig(cfg.DatabaseURL)
+	if err != nil {
+		return fmt.Errorf("database config: %w", err)
+	}
+	// every query becomes a span under the request or delivery that ran it
+	poolConfig.ConnConfig.Tracer = otelpgx.NewTracer()
+	pool, err := pgxpool.NewWithConfig(startCtx, poolConfig)
 	if err != nil {
 		return fmt.Errorf("database config: %w", err)
 	}
@@ -68,18 +91,24 @@ func run(logger *slog.Logger) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	const (
+		deliveryTimeout = 10 * time.Second
+		batchSize       = 20
+	)
 	worker := &relay.Worker{
 		Queue:  store.New(pool),
 		Logger: logger.With("component", "relay"),
-		// The timeout bounds one delivery; the lease below must stay longer than it.
-		Client:       &http.Client{Timeout: 10 * time.Second},
+		// The otelhttp transport adds a client span and sends traceparent, so the destination's own
+		// spans join the delivery trace.
+		Client:       &http.Client{Timeout: deliveryTimeout, Transport: otelhttp.NewTransport(http.DefaultTransport)},
 		URL:          cfg.DeliveryURL,
 		Secret:       cfg.DeliverySecret,
 		MaxAttempts:  cfg.MaxAttempts,
 		PollInterval: time.Second,
-		BatchSize:    20,
-		Lease:        time.Minute,
-		Backoff:      relay.ExponentialBackoff(10*time.Second, time.Hour),
+		BatchSize:    batchSize,
+		// long enough for a full batch of timed-out deliveries, plus room for the database writes
+		Lease:   batchSize*deliveryTimeout + time.Minute,
+		Backoff: relay.ExponentialBackoff(10*time.Second, time.Hour),
 	}
 	workerCtx, stopWorker := context.WithCancel(ctx)
 	workerDone := make(chan struct{})

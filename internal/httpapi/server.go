@@ -11,6 +11,11 @@ import (
 	"net/http"
 	"time"
 
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/trace"
+
 	"github.com/yogigaek/webhook-relay/internal/signature"
 	"github.com/yogigaek/webhook-relay/internal/store"
 )
@@ -45,9 +50,12 @@ func NewHandler(opts Options) http.Handler {
 		opts.Now = time.Now
 	}
 	mux := http.NewServeMux()
+	// Probes stay untraced: they run every few seconds and would bury the spans that matter.
 	mux.HandleFunc("GET /healthz", handleHealth)
 	mux.HandleFunc("GET /readyz", handleReady(opts))
-	mux.HandleFunc("POST /webhooks/{provider}", handleWebhook(opts))
+	// The span is named after the route pattern, not the URL, so every provider shares one name.
+	const webhookRoute = "POST /webhooks/{provider}"
+	mux.Handle(webhookRoute, otelhttp.NewHandler(handleWebhook(opts), webhookRoute))
 	return mux
 }
 
@@ -79,6 +87,9 @@ func handleWebhook(opts Options) http.HandlerFunc {
 			writeError(w, http.StatusNotFound, "unknown provider")
 			return
 		}
+		// set only for configured providers: any string in the URL would otherwise reach the traces
+		span := trace.SpanFromContext(r.Context())
+		span.SetAttributes(attribute.String("webhook.provider", provider))
 
 		mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
 		if err != nil || mediaType != "application/json" {
@@ -116,7 +127,24 @@ func handleWebhook(opts Options) http.HandlerFunc {
 			return
 		}
 
-		inserted, err := opts.Store.Save(r.Context(), store.Event{Provider: provider, EventID: envelope.ID, Payload: body})
+		span.SetAttributes(attribute.String("webhook.event_id", envelope.ID))
+
+		// The worker delivers later, in its own trace; storing this request's traceparent lets
+		// that delivery span link back here.
+		carrier := propagation.MapCarrier{}
+		propagation.TraceContext{}.Inject(r.Context(), carrier)
+
+		inserted, err := opts.Store.Save(r.Context(), store.Event{
+			Provider:    provider,
+			EventID:     envelope.ID,
+			Payload:     body,
+			TraceParent: carrier.Get("traceparent"),
+		})
+		if errors.Is(err, store.ErrInvalidPayload) {
+			// a retry would fail the same way, so tell the provider not to retry
+			writeError(w, http.StatusBadRequest, "payload cannot be stored")
+			return
+		}
 		if err != nil {
 			// 500 makes the provider retry later, which is what should happen while the database
 			// is down: the event is not lost, only delayed.
@@ -124,6 +152,7 @@ func handleWebhook(opts Options) http.HandlerFunc {
 			writeError(w, http.StatusInternalServerError, "could not store event")
 			return
 		}
+		span.SetAttributes(attribute.Bool("webhook.duplicate", !inserted))
 		if !inserted {
 			// Still a success, so the provider stops retrying an event that is already stored.
 			opts.Logger.InfoContext(r.Context(), "duplicate webhook ignored", "provider", provider, "event_id", envelope.ID)

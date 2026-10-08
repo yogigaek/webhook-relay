@@ -10,6 +10,12 @@ import (
 	"testing"
 	"time"
 
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/codes"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+	"go.opentelemetry.io/otel/trace/noop"
+
 	"github.com/yogigaek/webhook-relay/internal/signature"
 	"github.com/yogigaek/webhook-relay/internal/store"
 )
@@ -23,6 +29,7 @@ type fakeQueue struct {
 	delivered []int64
 	retried   map[int64]time.Duration
 	buried    map[int64]string
+	recordErr error // returned by every outcome method when set
 }
 
 func newFakeQueue(ds ...store.Delivery) *fakeQueue {
@@ -38,23 +45,32 @@ func (q *fakeQueue) ClaimDue(_ context.Context, limit int, _ time.Duration) ([]s
 	return out, nil
 }
 
-func (q *fakeQueue) MarkDelivered(_ context.Context, id int64) error {
+func (q *fakeQueue) MarkDelivered(_ context.Context, id int64, _ int) error {
 	q.mu.Lock()
 	defer q.mu.Unlock()
+	if q.recordErr != nil {
+		return q.recordErr
+	}
 	q.delivered = append(q.delivered, id)
 	return nil
 }
 
-func (q *fakeQueue) Retry(_ context.Context, id int64, delay time.Duration, _ string) error {
+func (q *fakeQueue) Retry(_ context.Context, id int64, _ int, delay time.Duration, _ string) error {
 	q.mu.Lock()
 	defer q.mu.Unlock()
+	if q.recordErr != nil {
+		return q.recordErr
+	}
 	q.retried[id] = delay
 	return nil
 }
 
-func (q *fakeQueue) Bury(_ context.Context, id int64, reason string) error {
+func (q *fakeQueue) Bury(_ context.Context, id int64, _ int, reason string) error {
 	q.mu.Lock()
 	defer q.mu.Unlock()
+	if q.recordErr != nil {
+		return q.recordErr
+	}
 	q.buried[id] = reason
 	return nil
 }
@@ -275,6 +291,7 @@ func TestExponentialBackoff(t *testing.T) {
 		{3, 40 * time.Second},
 		{6, 5 * time.Minute}, // 320s, capped
 		{100, 5 * time.Minute},
+		{0, 10 * time.Second}, // never happens, but must not panic on a negative shift
 	}
 	for _, tt := range tests {
 		for range 50 {
@@ -282,6 +299,88 @@ func TestExponentialBackoff(t *testing.T) {
 			if got < tt.full/2 || got > tt.full {
 				t.Fatalf("attempt %d: delay %v outside [%v, %v]", tt.attempt, got, tt.full/2, tt.full)
 			}
+		}
+	}
+}
+
+func TestDeliverySpanLinksToReceive(t *testing.T) {
+	recorder := tracetest.NewSpanRecorder()
+	otel.SetTracerProvider(sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(recorder)))
+	t.Cleanup(func() { otel.SetTracerProvider(noop.NewTracerProvider()) })
+
+	dest := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer dest.Close()
+	d := delivery(1)
+	d.TraceParent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+
+	newWorker(newFakeQueue(), dest.URL).handle(context.Background(), d)
+
+	spans := recorder.Ended()
+	if len(spans) != 1 {
+		t.Fatalf("%d spans ended, want 1", len(spans))
+	}
+	span := spans[0]
+	if links := span.Links(); len(links) != 1 || links[0].SpanContext.TraceID().String() != "4bf92f3577b34da6a3ce929d0e0e4736" {
+		t.Errorf("links = %+v, want one link to the receive trace", links)
+	}
+	if span.Status().Code != codes.Error {
+		t.Errorf("status = %v, want Error for a failed delivery", span.Status().Code)
+	}
+	var outcome string
+	for _, a := range span.Attributes() {
+		if a.Key == "relay.outcome" {
+			outcome = a.Value.AsString()
+		}
+	}
+	if outcome != "retry" {
+		t.Errorf("relay.outcome = %q, want retry", outcome)
+	}
+}
+
+// A delivery that completed just before shutdown still gets recorded; otherwise it would be sent
+// a second time after restart.
+func TestShutdownAfterSuccessfulDelivery(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	q := newFakeQueue()
+	w := newWorker(q, "http://destination.invalid/events")
+	// the destination answers 200, and shutdown begins the moment that answer is in
+	w.Client.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		cancel()
+		return &http.Response{StatusCode: http.StatusOK, Body: http.NoBody, Request: r}, nil
+	})
+
+	w.handle(ctx, delivery(1))
+
+	if got := q.outcome(1); got != "delivered" {
+		t.Errorf("outcome = %s, want delivered", got)
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func TestLeaseLostIsNotFatal(t *testing.T) {
+	recorder := tracetest.NewSpanRecorder()
+	otel.SetTracerProvider(sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(recorder)))
+	t.Cleanup(func() { otel.SetTracerProvider(noop.NewTracerProvider()) })
+
+	dest := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	defer dest.Close()
+	q := newFakeQueue()
+	q.recordErr = store.ErrLeaseLost
+
+	newWorker(q, dest.URL).handle(context.Background(), delivery(1))
+
+	spans := recorder.Ended()
+	if len(spans) != 1 {
+		t.Fatalf("%d spans, want 1", len(spans))
+	}
+	for _, a := range spans[0].Attributes() {
+		if a.Key == "relay.outcome" && a.Value.AsString() != "lease_lost" {
+			t.Errorf("relay.outcome = %s, want lease_lost", a.Value.AsString())
 		}
 	}
 }

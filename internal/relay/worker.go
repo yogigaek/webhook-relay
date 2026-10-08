@@ -14,6 +14,12 @@ import (
 	"strconv"
 	"time"
 
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/trace"
+
 	"github.com/yogigaek/webhook-relay/internal/signature"
 	"github.com/yogigaek/webhook-relay/internal/store"
 )
@@ -21,9 +27,9 @@ import (
 // Queue is the part of the store the worker needs; tests use an in-memory fake.
 type Queue interface {
 	ClaimDue(ctx context.Context, limit int, lease time.Duration) ([]store.Delivery, error)
-	MarkDelivered(ctx context.Context, id int64) error
-	Retry(ctx context.Context, id int64, delay time.Duration, reason string) error
-	Bury(ctx context.Context, id int64, reason string) error
+	MarkDelivered(ctx context.Context, id int64, attempt int) error
+	Retry(ctx context.Context, id int64, attempt int, delay time.Duration, reason string) error
+	Bury(ctx context.Context, id int64, attempt int, reason string) error
 }
 
 type Worker struct {
@@ -37,7 +43,9 @@ type Worker struct {
 	MaxAttempts  int
 	PollInterval time.Duration
 	BatchSize    int
-	// Lease must outlast a delivery (the client timeout); an event still leased is not retried.
+	// Lease must outlast a whole batch, BatchSize deliveries back to back at the client timeout each:
+	// deliveries run one after another, and an event whose lease ran out can be claimed by another
+	// worker while this one is still on its way to it.
 	Lease time.Duration
 	// Backoff gives the delay before the next attempt after the given failed attempt.
 	Backoff func(attempt int) time.Duration
@@ -74,14 +82,41 @@ func (w *Worker) processBatch(ctx context.Context) int {
 	return len(deliveries)
 }
 
+// The tracer is looked up per delivery rather than once at package load: a package-level tracer
+// stays bound to whichever global provider existed first.
+const tracerName = "github.com/yogigaek/webhook-relay/internal/relay"
+
 func (w *Worker) handle(ctx context.Context, d store.Delivery) {
+	// Each delivery is its own trace (it happens seconds or hours after the webhook arrived), linked
+	// to the trace of the request that received the event: a trace UI can jump from one to the other.
+	var links []trace.Link
+	if d.TraceParent != "" {
+		received := propagation.TraceContext{}.Extract(context.Background(), propagation.MapCarrier{"traceparent": d.TraceParent})
+		if sc := trace.SpanContextFromContext(received); sc.IsValid() {
+			links = append(links, trace.Link{SpanContext: sc})
+		}
+	}
+	ctx, span := otel.Tracer(tracerName).Start(ctx, "relay.deliver",
+		trace.WithLinks(links...),
+		trace.WithAttributes(
+			attribute.String("webhook.provider", d.Provider),
+			attribute.String("webhook.event_id", d.EventID),
+			attribute.Int("relay.attempt", d.Attempt),
+		),
+	)
+	defer span.End()
+
 	log := w.Logger.With("provider", d.Provider, "event_id", d.EventID, "attempt", d.Attempt)
 
 	err := w.deliver(ctx, d)
-	if ctx.Err() != nil {
-		// Shutting down mid-delivery: record nothing. The lease runs out and the next start
+	if err != nil {
+		span.SetStatus(codes.Error, err.Error())
+	}
+	if err != nil && ctx.Err() != nil {
+		// Shutting down cut the delivery off: record nothing. The lease runs out and the next start
 		// delivers the event again, so it is late but never lost.
 		log.InfoContext(ctx, "delivery interrupted by shutdown")
+		span.SetAttributes(attribute.String("relay.outcome", "interrupted"))
 		return
 	}
 
@@ -90,27 +125,41 @@ func (w *Worker) handle(ctx context.Context, d store.Delivery) {
 	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancel()
 
-	var permanent *permanentError
+	var (
+		permanent *permanentError
+		outcome   string
+		recordErr error
+	)
 	switch {
 	case err == nil:
-		if err := w.Queue.MarkDelivered(writeCtx, d.ID); err != nil {
-			log.ErrorContext(ctx, "mark delivered", "error", err)
-			return
-		}
-		log.InfoContext(ctx, "event delivered")
+		outcome = "delivered"
+		recordErr = w.Queue.MarkDelivered(writeCtx, d.ID, d.Attempt)
 	case errors.As(err, &permanent) || d.Attempt >= w.MaxAttempts:
-		if err := w.Queue.Bury(writeCtx, d.ID, err.Error()); err != nil {
-			log.ErrorContext(ctx, "bury event", "error", err)
-			return
-		}
-		log.WarnContext(ctx, "event moved to dead letter", "reason", err.Error())
+		outcome = "dead"
+		recordErr = w.Queue.Bury(writeCtx, d.ID, d.Attempt, err.Error())
 	default:
-		delay := w.Backoff(d.Attempt)
-		if err := w.Queue.Retry(writeCtx, d.ID, delay, err.Error()); err != nil {
-			log.ErrorContext(ctx, "schedule retry", "error", err)
-			return
-		}
-		log.WarnContext(ctx, "delivery failed, will retry", "reason", err.Error(), "retry_in", delay.String())
+		outcome = "retry"
+		recordErr = w.Queue.Retry(writeCtx, d.ID, d.Attempt, w.Backoff(d.Attempt), err.Error())
+	}
+
+	switch {
+	case errors.Is(recordErr, store.ErrLeaseLost):
+		// Another attempt owns the event now and will record its own result.
+		log.WarnContext(ctx, "outcome discarded: lease lost", "outcome", outcome)
+		span.SetAttributes(attribute.String("relay.outcome", "lease_lost"))
+	case recordErr != nil:
+		// The lease brings the event back, so it is delivered again rather than lost.
+		log.ErrorContext(ctx, "record outcome", "outcome", outcome, "error", recordErr)
+		span.SetAttributes(attribute.String("relay.outcome", "unrecorded"))
+	case outcome == "delivered":
+		log.InfoContext(ctx, "event delivered")
+		span.SetAttributes(attribute.String("relay.outcome", outcome))
+	case outcome == "dead":
+		log.WarnContext(ctx, "event moved to dead letter", "reason", err.Error())
+		span.SetAttributes(attribute.String("relay.outcome", outcome))
+	default:
+		log.WarnContext(ctx, "delivery failed, will retry", "reason", err.Error())
+		span.SetAttributes(attribute.String("relay.outcome", outcome))
 	}
 }
 
@@ -153,13 +202,14 @@ func (w *Worker) deliver(ctx context.Context, d store.Delivery) error {
 	}
 }
 
-// ExponentialBackoff doubles the delay after every failed attempt, from base up to max, with
+// ExponentialBackoff doubles the delay after every failed attempt, from base up to ceiling, with
 // jitter: after an outage, events that failed together do not all come back in the same second.
-func ExponentialBackoff(base, max time.Duration) func(attempt int) time.Duration {
+func ExponentialBackoff(base, ceiling time.Duration) func(attempt int) time.Duration {
 	return func(attempt int) time.Duration {
-		delay := max
+		attempt = max(attempt, 1) // attempts start at 1; a lower value must not make a negative shift
+		delay := ceiling
 		if attempt < 30 { // past this, base << attempt would overflow
-			if d := base << (attempt - 1); d > 0 && d < max {
+			if d := base << (attempt - 1); d > 0 && d < ceiling {
 				delay = d
 			}
 		}
